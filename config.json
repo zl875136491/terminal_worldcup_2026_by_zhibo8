@@ -1,0 +1,14 @@
+{
+  "zhibo8": {
+    "saishi_id": "1869192",
+    "match_date": "2026-06-17",
+    "match_url": "https://www.zhibo8.com/zhibo/zuqiu/2026/match1869192v.htm",
+    "league_id": "4",
+    "poll_intervals": {
+      "livetext": 2,
+      "animate": 2,
+      "lineup": 60,
+      "score": 10
+    }
+  }
+}
