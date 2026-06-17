@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from src.client import Zhibo8Client
@@ -21,6 +23,21 @@ LIVETEXT_URL = (
 LINEUP_URL = "https://dc.qiumibao.com/dc/matchs/data/{date}/match_lineup_{saishi_id}.htm"
 ANIMATE_URL = "https://dc.qiumibao.com/dc/matchs/data/{date}/animate_v2_{saishi_id}.htm"
 ANIMATE_CODE_URL = "https://dc.qiumibao.com/dc/matchs/data/{date}/animate_v2_{saishi_id}_code.htm"
+MATCH_EVENT_URL = "https://dc.qiumibao.com/dc/matchs/data/{date}/match_event_{saishi_id}.htm"
+MATCH_TEAM_STATICS_URL = (
+    "https://dc.qiumibao.com/dc/matchs/data/{date}/match_team_statics_{saishi_id}.htm"
+)
+
+STAT_LABELS: dict[str, str] = {
+    "possession_percentage": "控球",
+    "total_scoring_att": "射门",
+    "ontarget_scoring_att": "射正",
+    "won_corners": "角球",
+    "fk_foul_lost": "犯规",
+    "pass_percentage": "传球成功率",
+    "total_pass": "传球",
+    "total_tackle": "抢断",
+}
 
 
 @dataclass
@@ -77,6 +94,21 @@ def list_world_cup_matches(client: Zhibo8Client) -> list[MatchSummary]:
     return list_matches(client, league_id=WORLD_CUP_LEAGUE_ID)
 
 
+def list_today_world_cup_matches(
+    client: Zhibo8Client,
+    *,
+    on_date: str | None = None,
+) -> list[MatchSummary]:
+    target_date = on_date or date.today().isoformat()
+    matches = [
+        item
+        for item in list_world_cup_matches(client)
+        if item.sdate == target_date
+    ]
+    matches.sort(key=lambda item: item.time)
+    return matches
+
+
 def fetch_match_meta(client: Zhibo8Client, saishi_id: str) -> dict[str, Any]:
     data = client.get_json(MATCH_META_URL.format(saishi_id=saishi_id))
     return data if isinstance(data, dict) else {}
@@ -102,21 +134,189 @@ def fetch_animate(client: Zhibo8Client, saishi_id: str, sdate: str) -> dict[str,
     return data if isinstance(data, dict) else {}
 
 
+def fetch_match_events(client: Zhibo8Client, saishi_id: str, sdate: str) -> list[dict[str, Any]]:
+    try:
+        payload = client.get_json(MATCH_EVENT_URL.format(date=sdate, saishi_id=saishi_id))
+    except Exception:  # noqa: BLE001
+        return []
+    events = payload.get("data") if isinstance(payload, dict) else None
+    return events if isinstance(events, list) else []
+
+
+def fetch_team_stats(client: Zhibo8Client, saishi_id: str, sdate: str) -> dict[str, dict[str, str]]:
+    try:
+        payload = client.get_json(MATCH_TEAM_STATICS_URL.format(date=sdate, saishi_id=saishi_id))
+    except Exception:  # noqa: BLE001
+        return {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def parse_match_player_data(match_info: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+    if not match_info:
+        return [], []
+    raw = match_info.get("player_data")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = {}
+    if not isinstance(raw, dict):
+        return [], []
+
+    def _format_goals(items: list[Any]) -> list[str]:
+        lines: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type")) != "1" and str(item.get("code")) != "1":
+                continue
+            minute = str(item.get("value") or "").strip()
+            name = str(item.get("player_name") or "").strip()
+            if name:
+                lines.append(f"{minute} {name}")
+        return lines
+
+    return _format_goals(raw.get("left") or []), _format_goals(raw.get("right") or [])
+
+
+def format_match_event_line(event: dict[str, Any]) -> str | None:
+    if str(event.get("is_hide") or "") == "1" and not str(event.get("mark") or ""):
+        return None
+    minute = str(event.get("time") or "").strip()
+    code = str(event.get("event_code_cn") or "").strip()
+    info = str(event.get("Info") or event.get("info") or "").strip()
+    player = str(event.get("player_name_cn") or "").strip()
+    if not code and not info:
+        return None
+    if info:
+        text = info
+    elif player:
+        text = f"{player} {code}"
+    else:
+        text = code
+    if minute and minute != "0":
+        return f"{minute}' {text}"
+    return text
+
+
 def fetch_max_sid(client: Zhibo8Client, saishi_id: str) -> int:
     text = client.get_text(MAX_SID_URL.format(saishi_id=saishi_id))
     return int(text)
 
 
-def fetch_livetext(client: Zhibo8Client, saishi_id: str, max_sid: int) -> list[dict[str, Any]]:
-    if max_sid <= 0:
+def fetch_livetext(client: Zhibo8Client, saishi_id: str, page_sid: int) -> list[dict[str, Any]]:
+    if page_sid <= 0:
         return []
-    url = LIVETEXT_URL.format(saishi_id=saishi_id, max_sid=max_sid)
+    url = LIVETEXT_URL.format(saishi_id=saishi_id, max_sid=page_sid)
     response = client.http.get(url, timeout=client.timeout)
     if response.status_code == 404:
         return []
     response.raise_for_status()
     data = response.json()
     return data if isinstance(data, list) else []
+
+
+def format_livetext_line(item: dict[str, Any]) -> str:
+    text = str(item.get("live_text") or "").strip()
+    if not text:
+        return ""
+    ptime = str(item.get("live_ptime") or "").strip()
+    user = str(item.get("user_chn") or "").strip()
+    score = f"{item.get('home_score', '-')}-{item.get('visit_score', '-')}"
+    if user:
+        body = f"{user}: {text}"
+    else:
+        body = text
+    if ptime:
+        return f"[{score}] {ptime} {body}"
+    return f"[{score}] {body}"
+
+
+def fetch_livetext_updates(
+    client: Zhibo8Client,
+    saishi_id: str,
+    last_sid: int,
+    *,
+    limit: int = 40,
+) -> tuple[list[dict[str, Any]], int]:
+    max_sid = fetch_max_sid(client, saishi_id)
+    if max_sid <= 0:
+        return [], last_sid
+
+    collected: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    page_sid = max_sid
+    misses = 0
+
+    while page_sid > last_sid and len(collected) < limit and misses < 25:
+        batch = fetch_livetext(client, saishi_id, page_sid)
+        if not batch:
+            misses += 1
+            page_sid -= 1
+            continue
+
+        misses = 0
+        min_sid = page_sid
+        for item in batch:
+            live_sid = int(item.get("live_sid") or 0)
+            if live_sid <= 0:
+                continue
+            min_sid = min(min_sid, live_sid)
+            if live_sid <= last_sid or live_sid in seen:
+                continue
+            seen.add(live_sid)
+            collected.append(item)
+
+        page_sid = min_sid - 1
+
+    collected.sort(key=lambda item: int(item.get("live_sid") or 0))
+    if collected:
+        new_last = max(int(item.get("live_sid") or 0) for item in collected)
+    else:
+        new_last = last_sid
+    return collected, new_last
+
+
+def fetch_recent_livetext(
+    client: Zhibo8Client,
+    saishi_id: str,
+    *,
+    limit: int = 30,
+) -> tuple[list[str], int]:
+    max_sid = fetch_max_sid(client, saishi_id)
+    if max_sid <= 0:
+        return [], 0
+
+    seen_sids: set[int] = set()
+    collected: list[tuple[int, str]] = []
+    misses = 0
+    page_sid = max_sid
+
+    while page_sid > 0 and len(collected) < limit and misses < 25:
+        batch = fetch_livetext(client, saishi_id, page_sid)
+        if not batch:
+            misses += 1
+            page_sid -= 1
+            continue
+
+        misses = 0
+        min_sid = page_sid
+        for item in batch:
+            live_sid = int(item.get("live_sid") or 0)
+            if live_sid <= 0 or live_sid in seen_sids:
+                continue
+            seen_sids.add(live_sid)
+            min_sid = min(min_sid, live_sid)
+            line = format_livetext_line(item)
+            if line:
+                collected.append((live_sid, line))
+
+        page_sid = min_sid - 1
+
+    collected.sort(key=lambda pair: pair[0])
+    last_sid = max(seen_sids) if seen_sids else max_sid
+    return [text for _, text in collected[-limit:]], last_sid
 
 
 def is_monster_brief(item: dict[str, Any]) -> bool:

@@ -10,9 +10,9 @@ ROOT = Path(__file__).resolve().parent.parent
 APP_CONFIG_PATH = ROOT / "config.json"
 
 DEFAULT_ZHIBO8_CONFIG: dict[str, Any] = {
-    "saishi_id": "1869192",
+    "saishi_id": "",
     "match_date": "",
-    "match_url": "https://www.zhibo8.com/zhibo/zuqiu/2026/match1869192v.htm",
+    "match_url": "",
     "league_id": "4",
     "poll_intervals": {
         "livetext": 2,

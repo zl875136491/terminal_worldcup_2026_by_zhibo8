@@ -5,6 +5,7 @@ from typing import Any
 import unicodedata
 
 from src.animator import PitchAnimator
+from src.api import STAT_LABELS, format_match_event_line
 
 
 ROW_BY_POSITION_X = {
@@ -27,6 +28,7 @@ COL_BY_POSITION_Y = {
     "R": 8,
 }
 
+
 def _display_width(text: str) -> int:
     width = 0
     for ch in text:
@@ -36,10 +38,12 @@ def _display_width(text: str) -> int:
             width += 1
     return width
 
+
 def _pad_display(text: str, target: int) -> str:
     if _display_width(text) >= target:
         return text
     return text + " " * (target - _display_width(text))
+
 
 def _truncate_display(text: str, target: int) -> str:
     if _display_width(text) <= target:
@@ -53,6 +57,7 @@ def _truncate_display(text: str, target: int) -> str:
         result += ch
         width += ch_w
     return result
+
 
 def _wrap_lines(text: str, width: int) -> list[str]:
     if width <= 0:
@@ -71,27 +76,47 @@ def _wrap_lines(text: str, width: int) -> list[str]:
         lines.append(current)
     return lines or [""]
 
+
+def _is_box_line(line: str) -> bool:
+    return bool(line) and set(line) <= set("+-| ") and any(ch in "+-|" for ch in line)
+
+
 def _wrap_panel(body_lines: list[str], inner_width: int) -> list[str]:
     wrapped: list[str] = []
     for line in body_lines:
-        wrapped.extend(_wrap_lines(line, inner_width))
+        if _is_box_line(line):
+            if _display_width(line) <= inner_width:
+                wrapped.append(line)
+            else:
+                wrapped.append(_truncate_display(line, inner_width))
+        else:
+            wrapped.extend(_wrap_lines(line, inner_width))
     return wrapped or ["暂无数据"]
 
-def _render_box(title: str, body_lines: list[str], width: int, min_body_lines: int | None = None) -> list[str]:
-    inner_width = max(width - 4, 10)
+
+def _render_box(
+    title: str,
+    body_lines: list[str],
+    width: int,
+    *,
+    max_body_lines: int | None = None,
+    clip_tail: bool = True,
+) -> list[str]:
+    inner_width = max(width - 4, 8)
     wrapped = _wrap_panel(body_lines, inner_width)
-    if min_body_lines is not None and len(wrapped) < min_body_lines:
-        wrapped.extend([""] * (min_body_lines - len(wrapped)))
+    if max_body_lines is not None and len(wrapped) > max_body_lines:
+        wrapped = wrapped[-max_body_lines:] if clip_tail else wrapped[:max_body_lines]
 
     top = "+" + "-" * (width - 2) + "+"
-    title_line = "| " + title.center(width - 4) + " |"
+    title_line = "| " + _pad_display(_truncate_display(title, width - 4), width - 4) + " |"
     separator = "+" + "-" * (width - 2) + "+"
     content = [f"| {_pad_display(_truncate_display(line, inner_width), inner_width)} |" for line in wrapped]
     bottom = "+" + "-" * (width - 2) + "+"
     return [top, title_line, separator, *content, bottom]
 
-def _merge_columns(columns: list[list[str]], col_widths: list[int], gap: int = 2) -> list[str]:
-    height = max(len(col) for col in columns)
+
+def _merge_columns(columns: list[list[str]], col_widths: list[int], gap: int = 1) -> list[str]:
+    height = max(len(col) for col in columns) if columns else 0
     gap_str = " " * gap
     merged: list[str] = []
     for row in range(height):
@@ -101,6 +126,8 @@ def _merge_columns(columns: list[list[str]], col_widths: list[int], gap: int = 2
                 line = col[row]
                 if _display_width(line) < box_width:
                     line = _pad_display(line, box_width)
+                elif _display_width(line) > box_width:
+                    line = _truncate_display(line, box_width)
                 parts.append(line)
             else:
                 parts.append(" " * box_width)
@@ -108,65 +135,108 @@ def _merge_columns(columns: list[list[str]], col_widths: list[int], gap: int = 2
     return merged
 
 
-def _merge_rows(rows: list[list[str]], row_heights: list[int] | None = None) -> list[str]:
-    if not rows:
-        return []
-    width = max(max(_display_width(line) for line in block) for block in rows)
-    merged: list[str] = []
-    for block in rows:
-        padded = []
-        for line in block:
-            if _display_width(line) < width:
-                line = _pad_display(line, width)
-            padded.append(line)
-        merged.extend(padded)
-        if block is not rows[-1]:
-            merged.append("")
-    return merged
-
-
 def _formation_grid(
     starters: list[dict[str, Any]],
     *,
-    width: int = 9,
-    height: int = 7,
-) -> tuple[list[str], list[str]]:
-    grid: list[list[str]] = [["  "] * width for _ in range(height)]
+    col_width: int,
+    mirror: bool = False,
+) -> list[str]:
+    grid_width = max(5, min(9, (col_width - 2) // 3))
+    height = 5
+
+    grid: list[list[str]] = [["   "] * grid_width for _ in range(height)]
     occupied: set[tuple[int, int]] = set()
-    legend: list[str] = []
 
     for player in starters:
         number = str(player.get("shirt_number") or "").strip()
-        name = str(player.get("player_name_cn") or "").strip()
         if not number:
             continue
 
         pos_x = str(player.get("positionX") or player.get("positionX2") or "M")
         pos_y = str(player.get("positionY") or "C")
         row = ROW_BY_POSITION_X.get(pos_x, 3)
+        row = min(height - 1, round(row * (height - 1) / 6))
         col = COL_BY_POSITION_Y.get(pos_y, 4)
+        col = min(grid_width - 1, round(col * (grid_width - 1) / 8))
+        if mirror:
+            col = grid_width - 1 - col
 
-        while (row, col) in occupied and col < width - 1:
+        while (row, col) in occupied and col < grid_width - 1:
             col += 1
         while (row, col) in occupied and row < height - 1:
             row += 1
         occupied.add((row, col))
-        grid[row][col] = number.rjust(2)
-        legend.append(f"{number}: {name}")
+        grid[row][col] = f"{number:>2} "
 
-    pitch = ["+" + "-" * (width * 2) + "+"]
+    pitch_width = grid_width * 3
+    top = "+" + "-" * pitch_width + "+"
+    body = [top]
     for row in grid:
-        pitch.append("|" + "".join(cell for cell in row) + "|")
-    pitch.append("+" + "-" * (width * 2) + "+")
-    return pitch, legend
+        body.append("|" + "".join(cell for cell in row) + "|")
+    body.append(top)
+    return body
+
+
+def _player_badges(player: dict[str, Any]) -> str:
+    badges: list[str] = []
+    goals = int(player.get("goal") or 0)
+    if goals:
+        badges.append(f"球×{goals}")
+    assists = int(player.get("assist") or 0)
+    if assists:
+        badges.append(f"助×{assists}")
+
+    card = player.get("card")
+    if isinstance(card, dict):
+        if int(card.get("red") or 0):
+            badges.append("红牌")
+        elif int(card.get("yellow") or 0):
+            badges.append("黄牌")
+
+    up_time = str(player.get("up_time") or "").strip()
+    down_time = str(player.get("down_time") or "").strip()
+    if up_time:
+        badges.append(f"↑{up_time}'")
+    if down_time:
+        badges.append(f"↓{down_time}'")
+    return " ".join(badges)
+
+
+def _format_player_line(player: dict[str, Any], *, width: int) -> str:
+    number = str(player.get("shirt_number") or "-").rjust(2)
+    name_w = max(4, width - 14)
+    name = _truncate_display(str(player.get("player_name_cn") or ""), name_w)
+    pos = str(player.get("position_cn") or "")[:2]
+    badges = _player_badges(player)
+    line = f"{number} {name} {pos}"
+    if badges:
+        line += f" {badges}"
+    return _truncate_display(line, width)
+
+
+def _render_team_roster(
+    players: list[dict[str, Any]],
+    *,
+    title: str,
+    width: int,
+) -> list[str]:
+    lines = [_truncate_display(title, width)]
+    if not players:
+        lines.append("暂无")
+        return lines
+    for player in players:
+        lines.append(_format_player_line(player, width=width))
+    return lines
 
 
 def render_lineup_panel(
     lineup: dict[str, Any] | None,
     *,
-    home_team_id: str | None = None,
-    away_team_id: str | None = None,
-    inner_width: int = 40,
+    home_team_id: str = "",
+    away_team_id: str = "",
+    home_team_name: str = "主队",
+    away_team_name: str = "客队",
+    total_width: int = 80,
 ) -> list[str]:
     if not lineup:
         return ["阵容加载中..."]
@@ -176,32 +246,65 @@ def render_lineup_panel(
     home_id = home_team_id or (team_ids[0] if team_ids else "")
     away_id = away_team_id or (team_ids[1] if len(team_ids) > 1 else "")
 
-    lines: list[str] = []
-    for label, team_id in (("主队", home_id), ("客队", away_id)):
-        if not team_id:
-            continue
-        starters = [player for player in data.get(team_id) or [] if player.get("status") == "z"]
-        if not starters:
-            lines.append(f"{label}: 暂无首发")
-            lines.append("")
-            continue
-        pitch, legend = _formation_grid(starters)
-        lines.append(f"{label} ({len(starters)}人)")
-        lines.extend(pitch)
-        lines.append("")
-        current = ""
-        for item in legend:
-            piece = item if not current else f"  {item}"
-            if _display_width(current + piece) > inner_width:
-                lines.append(current)
-                current = item
-            else:
-                current += piece
-        if current:
-            lines.append(current)
-        lines.append("")
+    info = lineup.get("info") or {}
+    if isinstance(info, dict):
+        home_team_name = str((info.get(home_id) or {}).get("name") or home_team_name)
+        away_team_name = str((info.get(away_id) or {}).get("name") or away_team_name)
 
-    return lines or ["暂无阵容数据"]
+    coach = lineup.get("coach") or {}
+    home_formation = str(lineup.get(home_id) or "")
+    away_formation = str(lineup.get(away_id) or "")
+
+    home_starters = [p for p in data.get(home_id) or [] if p.get("status") == "z"]
+    away_starters = [p for p in data.get(away_id) or [] if p.get("status") == "z"]
+    home_subs = [p for p in data.get(home_id) or [] if p.get("status") == "t"]
+    away_subs = [p for p in data.get(away_id) or [] if p.get("status") == "t"]
+
+    gap = 1
+    col_width = max((total_width - gap) // 2, 18)
+
+    home_title = _truncate_display(f"{home_team_name} {home_formation}", col_width)
+    away_title = _truncate_display(f"{away_team_name} {away_formation}", col_width)
+    home_coach = _truncate_display(f"教练 {coach.get(home_id, '-')}", col_width)
+    away_coach = _truncate_display(f"教练 {coach.get(away_id, '-')}", col_width)
+
+    home_pitch = (
+        _formation_grid(home_starters, col_width=col_width, mirror=False)
+        if home_starters
+        else ["(暂无阵型)"]
+    )
+    away_pitch = (
+        _formation_grid(away_starters, col_width=col_width, mirror=True)
+        if away_starters
+        else ["(暂无阵型)"]
+    )
+
+    formation = _merge_columns(
+        [[home_title, home_coach, *home_pitch], [away_title, away_coach, *away_pitch]],
+        [col_width, col_width],
+        gap=gap,
+    )
+
+    starters = _merge_columns(
+        [
+            _render_team_roster(home_starters, title=f"首发 {len(home_starters)}", width=col_width),
+            _render_team_roster(away_starters, title=f"首发 {len(away_starters)}", width=col_width),
+        ],
+        [col_width, col_width],
+        gap=gap,
+    )
+
+    subs = _merge_columns(
+        [
+            _render_team_roster(home_subs, title=f"替补 {len(home_subs)}", width=col_width),
+            _render_team_roster(away_subs, title=f"替补 {len(away_subs)}", width=col_width),
+        ],
+        [col_width, col_width],
+        gap=gap,
+    )
+
+    lines = [*formation, "", *starters, "", *subs]
+    return lines
 
 
 def render_pitch_panel(animator: PitchAnimator, match_info: dict[str, Any] | None) -> list[str]:
@@ -213,39 +316,170 @@ def render_pitch_panel(animator: PitchAnimator, match_info: dict[str, Any] | Non
         state.away_score = str(match_info.get("visit_score") or state.away_score)
         state.period = str(match_info.get("period_cn") or state.period)
 
-    header = (
-        f"{state.home_team} {state.home_score} - {state.away_score} {state.away_team}  "
-        f"{state.period or '-'}"
-    )
-    lines = [header, ""]
+    lines = [
+        _truncate_display(
+            f"{state.home_team} {state.home_score}-{state.away_score} {state.away_team}  "
+            f"{state.period or '-'}",
+            28,
+        ),
+    ]
+    if state.phase_hint and state.phase_hint != (state.period or ""):
+        lines.append(_truncate_display(state.phase_hint, 28))
+
+    lines.append("")
     lines.extend(animator.render())
-    if state.event_text:
-        lines.append("")
-        lines.append(f"事件: {state.event_text}")
-    if state.possession_team:
-        lines.append(f"控球: {state.possession_team}")
+
+    if state.event_text and state.event_text not in {state.phase_hint, "等待开球"}:
+        lines.append(_truncate_display(f"▶ {state.event_text}", 28))
+
+    current, total = animator.frame_progress()
+    if total > 1:
+        lines.append(f"帧 {current}/{total}")
+
     return lines
 
 
-def render_brief_panel(briefs: list[str], inner_width: int, status_message: str = "") -> list[str]:
-    if status_message:
-        return _wrap_lines(status_message, inner_width)
-    if not briefs:
-        return ["暂无怪兽简报", "", "等待文字直播更新..."]
+def render_report_panel(
+    match_info: dict[str, Any] | None,
+    lineup: dict[str, Any] | None,
+    team_stats: dict[str, dict[str, str]],
+    events: list[dict[str, Any]],
+    *,
+    inner_width: int,
+) -> list[str]:
+    if not match_info:
+        return ["战报加载中..."]
 
-    lines: list[str] = []
-    for brief in briefs[-30:]:
-        lines.extend(_wrap_lines(brief, inner_width))
+    home_id = str(match_info.get("home_id") or "")
+    away_id = str(match_info.get("visit_id") or "")
+    home_name = str(match_info.get("home_team") or "主队")
+    away_name = str(match_info.get("visit_team") or "客队")
+    half_score = str(match_info.get("half_score") or "").strip()
+
+    lines = [
+        f"{home_name} {match_info.get('home_score', '-')} - "
+        f"{match_info.get('visit_score', '-')} {away_name}",
+        f"状态: {match_info.get('period_cn') or '-'}",
+    ]
+    if half_score:
+        lines.append(half_score)
+
+    if lineup:
+        venue = str(lineup.get("venue") or "").strip()
+        weather = str(lineup.get("weather") or "").strip()
+        temp = str(lineup.get("temperature") or "").strip()
+        env = " · ".join(part for part in (venue, weather, temp) if part)
+        if env:
+            lines.extend(_wrap_lines(env, inner_width))
+
+    home_stats = team_stats.get(home_id) or {}
+    away_stats = team_stats.get(away_id) or {}
+    stat_keys = [
+        "possession_percentage",
+        "total_scoring_att",
+        "ontarget_scoring_att",
+        "won_corners",
+        "fk_foul_lost",
+        "pass_percentage",
+    ]
+    has_stats = any(home_stats.get(k) or away_stats.get(k) for k in stat_keys)
+    if has_stats:
+        lines.append("")
+        lines.append("技术统计")
+        for key in stat_keys:
+            left = str(home_stats.get(key) or "-")
+            right = str(away_stats.get(key) or "-")
+            if left == "-" and right == "-":
+                continue
+            label = STAT_LABELS.get(key, key)
+            lines.append(_truncate_display(f"{left:>5} {label} {right:<5}", inner_width))
+
+    timeline: list[str] = []
+    for event in events:
+        line = format_match_event_line(event)
+        if line:
+            timeline.append(line)
+
+    if timeline:
+        lines.append("")
+        lines.append("事件")
+        lines.extend(timeline[-8:])
+
+    return lines or ["暂无战报"]
+
+
+def render_livetext_panel(
+    live_feed: list[str],
+    inner_width: int,
+    status_message: str = "",
+    *,
+    max_lines: int | None = None,
+) -> list[str]:
+    if status_message:
+        lines = _wrap_lines(status_message, inner_width)
+    elif not live_feed:
+        lines = ["等待文字直播...", "解说员播报将显示在此"]
+    else:
+        lines = []
+        for entry in live_feed[-25:]:
+            lines.extend(_wrap_lines(entry, inner_width))
+
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return lines
+
+
+def render_brief_panel(
+    briefs: list[str],
+    inner_width: int,
+    status_message: str = "",
+    *,
+    max_lines: int | None = None,
+) -> list[str]:
+    if status_message:
+        lines = _wrap_lines(status_message, inner_width)
+    elif not briefs:
+        lines = ["暂无怪兽简报", "等待文字直播..."]
+    else:
+        lines = []
+        for brief in briefs[-20:]:
+            lines.extend(_wrap_lines(brief, inner_width))
+
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[-max_lines:]
     return lines
 
 
 def render_header(*, saishi_id: str, match_url: str, updated_at: datetime) -> list[str]:
     return [
-        "直播吧世界杯终端看板  |  数据源: zhibo8.com (HTTP 轮询)",
-        f"比赛ID: {saishi_id}  |  页面: {match_url}",
-        f"更新时间: {updated_at.strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
+        "直播吧世界杯终端看板  |  数据源: zhibo8.com",
+        f"比赛ID: {saishi_id}  |  {match_url}",
+        f"更新: {updated_at.strftime('%H:%M:%S')}",
     ]
+
+
+def _stack_panels_horizontally(
+    panels: list[list[str]],
+    widths: list[int],
+    gap: int = 1,
+) -> list[str]:
+    height = max(len(panel) for panel in panels) if panels else 0
+    gap_str = " " * gap
+    merged: list[str] = []
+    for row in range(height):
+        parts: list[str] = []
+        for panel, width in zip(panels, widths):
+            if row < len(panel):
+                line = panel[row]
+                if _display_width(line) < width:
+                    line = _pad_display(line, width)
+                elif _display_width(line) > width:
+                    line = _truncate_display(line, width)
+                parts.append(line)
+            else:
+                parts.append(" " * width)
+        merged.append(gap_str.join(parts))
+    return merged
 
 
 def render_dashboard(
@@ -254,41 +488,80 @@ def render_dashboard(
     match_url: str,
     match_info: dict[str, Any] | None,
     lineup: dict[str, Any] | None,
+    team_stats: dict[str, dict[str, str]],
+    events: list[dict[str, Any]],
     animator: PitchAnimator,
-    briefs: list[str],
+    live_feed: list[str],
+    briefs: list[str] | None = None,
     terminal_width: int,
+    terminal_height: int = 30,
     status_message: str = "",
 ) -> str:
-    brief_width = max(terminal_width // 4, 24)
-    main_width = max(terminal_width - brief_width - 2, 40)
-    brief_inner = max(brief_width - 4, 16)
-    main_inner = max(main_width - 4, 20)
+    width = max(terminal_width, 72)
+    header = render_header(saishi_id=saishi_id, match_url=match_url, updated_at=datetime.now())
+    body_height = max(terminal_height - len(header) - 1, 10)
+    compact = body_height < 22 or width < 90
+    top_content_lines = 6 if compact else max(8, min(body_height // 2 - 5, 10))
 
-    header = render_header(
-        saishi_id=saishi_id,
-        match_url=match_url,
-        updated_at=datetime.now(),
+    gap = 1
+    anim_w = max(width * 28 // 100, 26)
+    report_w = max(width * 32 // 100, 28)
+    brief_w = max(width - anim_w - report_w - gap * 2, 24)
+
+    anim_inner = max(anim_w - 4, 12)
+    anim_h = 4 if compact else max(5, min(top_content_lines - 2, 7))
+    anim_w_inner = max(11, min(anim_inner - 2, 17 if compact else 19))
+    animator.height = anim_h
+    animator.width = anim_w_inner
+
+    pitch_body = render_pitch_panel(animator, match_info)
+    report_body = render_report_panel(
+        match_info,
+        lineup,
+        team_stats,
+        events,
+        inner_width=max(report_w - 4, 16),
+    )
+    livetext_body = render_livetext_panel(
+        live_feed,
+        max(brief_w - 4, 16),
+        status_message,
+        max_lines=max(top_content_lines, 4),
     )
 
-    pitch_lines = render_pitch_panel(animator, match_info)
-    lineup_lines = render_lineup_panel(
+    top_row = _stack_panels_horizontally(
+        [
+            _render_box("模拟动画", pitch_body, anim_w, max_body_lines=top_content_lines, clip_tail=False),
+            _render_box("战报数据", report_body, report_w, max_body_lines=top_content_lines, clip_tail=False),
+            _render_box("文字直播", livetext_body, brief_w, max_body_lines=top_content_lines, clip_tail=True),
+        ],
+        [anim_w, report_w, brief_w],
+        gap=gap,
+    )
+
+    lineup_body = render_lineup_panel(
         lineup,
         home_team_id=str((match_info or {}).get("home_id") or ""),
         away_team_id=str((match_info or {}).get("visit_id") or ""),
-        inner_width=main_inner,
+        home_team_name=str((match_info or {}).get("home_team") or "主队"),
+        away_team_name=str((match_info or {}).get("visit_team") or "客队"),
+        total_width=max(width - 4, 40),
     )
-    brief_lines = render_brief_panel(briefs, brief_inner, status_message)
+    lineup_budget = max(body_height - len(top_row) - 2, 8)
+    lineup_box = _render_box(
+        "阵容",
+        lineup_body,
+        width,
+        max_body_lines=max(lineup_budget - 5, 4),
+        clip_tail=False,
+    )
 
-    pitch_body = len(_wrap_panel(pitch_lines, main_inner))
-    lineup_body = len(_wrap_panel(lineup_lines, main_inner))
-    brief_body = max(len(_wrap_panel(brief_lines, brief_inner)), pitch_body + lineup_body + 1)
-
-    pitch_box = _render_box("动画", pitch_lines, main_width, min_body_lines=pitch_body)
-    lineup_box = _render_box("阵容", lineup_lines, main_width, min_body_lines=lineup_body)
-    brief_box = _render_box("直播 · 怪兽简报", brief_lines, brief_width, min_body_lines=brief_body)
-
-    left_column = _merge_rows([pitch_box, lineup_box])
-    left_width = max(_display_width(line) for line in left_column)
-    brief_width = max(_display_width(line) for line in brief_box)
-    body = _merge_columns([left_column, brief_box], [left_width, brief_width])
-    return "\n".join(header + body)
+    lines = header + [""] + top_row + [""] + lineup_box
+    if len(lines) > terminal_height:
+        keep = terminal_height
+        head_len = len(header) + 1 + len(top_row) + 1
+        lineup_keep = max(keep - head_len, 6)
+        lines = header + [""] + top_row + [""] + lineup_box[:lineup_keep]
+    if len(lines) < terminal_height:
+        lines.extend([""] * (terminal_height - len(lines)))
+    return "\n".join(lines[:terminal_height])
