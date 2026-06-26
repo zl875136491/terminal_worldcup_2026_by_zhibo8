@@ -110,7 +110,13 @@ def run_dashboard(
     client = Zhibo8Client()
     config = load_zhibo8_config()
     saishi_id = parse_saishi_id(saishi_id)
-    sdate = resolve_match_date(client, saishi_id, sdate=match_date or config.get("match_date") or None)
+    if match_date:
+        sdate = match_date
+    else:
+        try:
+            sdate = resolve_match_date(client, saishi_id)
+        except RuntimeError:
+            sdate = date.today().isoformat()
 
     config["saishi_id"] = saishi_id
     config["match_date"] = sdate
