@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import select
 import shutil
 import sys
+import termios
 import time
+import tty
 from datetime import date
 from typing import Any
 
@@ -29,7 +32,7 @@ from src.api import (
 )
 from src.client import Zhibo8Client
 from src.config import load_zhibo8_config, save_zhibo8_config
-from src.dashboard import render_dashboard
+from src.dashboard import LineupView, render_dashboard
 
 
 _ALT_SCREEN_ON = "\033[?1049h"
@@ -61,6 +64,32 @@ def refresh_screen(content: str) -> None:
         sys.stdout.write("\n")
     sys.stdout.write(_SHOW_CURSOR)
     sys.stdout.flush()
+
+
+def enable_cbreak_input() -> list[Any] | None:
+    if not sys.stdin.isatty():
+        return None
+    fd = sys.stdin.fileno()
+    return termios.tcgetattr(fd)
+
+
+def set_cbreak_input(enabled: bool, saved: list[Any] | None) -> None:
+    if saved is None:
+        return
+    fd = sys.stdin.fileno()
+    if enabled:
+        tty.setcbreak(fd)
+    else:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def poll_key(timeout: float) -> str | None:
+    if not sys.stdin.isatty():
+        return None
+    ready, _, _ = select.select([sys.stdin], [], [], max(timeout, 0))
+    if not ready:
+        return None
+    return sys.stdin.read(1)
 
 
 def pick_world_cup_match(client: Zhibo8Client, *, match_date: str | None = None) -> str:
@@ -150,8 +179,11 @@ def run_dashboard(
     last_score = 0.0
     last_report = 0.0
     report_interval = max(int(poll.get("report", 30)), 10)
+    lineup_view: LineupView = "formation"
+    saved_tty = enable_cbreak_input()
 
     enter_alt_screen()
+    set_cbreak_input(True, saved_tty)
 
     try:
         while True:
@@ -216,6 +248,7 @@ def run_dashboard(
                 terminal_width=term_size.columns,
                 terminal_height=term_size.lines,
                 status_message=status_message,
+                lineup_view=lineup_view,
             )
             refresh_screen(frame)
 
@@ -227,10 +260,13 @@ def run_dashboard(
                 max(animate_interval - (time.time() - last_animate), 0.2),
                 1.0,
             )
-            time.sleep(sleep_for)
+            key = poll_key(sleep_for)
+            if key in {"t", "T"}:
+                lineup_view = "roster" if lineup_view == "formation" else "formation"
     except KeyboardInterrupt:
         pass
     finally:
+        set_cbreak_input(False, saved_tty)
         leave_alt_screen()
         print("\n已退出。")
 
