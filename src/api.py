@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 from src.client import Zhibo8Client
 
 WORLD_CUP_LEAGUE_ID = "4"
-MONSTER_USER_ID = "63"
-MONSTER_USER_NAME = "怪兽"
 
 LIST_URL = "https://bifen4m.qiumibao.com/json/list.htm"
 MATCH_INFO_URL = "https://bifen4pc2.qiumibao.com/json/{date}/{saishi_id}.htm"
@@ -39,6 +38,9 @@ STAT_LABELS: dict[str, str] = {
     "total_tackle": "抢断",
 }
 
+_LIST_CACHE: tuple[float, list["MatchSummary"]] | None = None
+_LIST_CACHE_TTL = 60.0
+
 
 @dataclass
 class MatchSummary:
@@ -64,13 +66,10 @@ def parse_saishi_id(value: str) -> str:
     raise ValueError(f"无法解析比赛 ID: {value}")
 
 
-def list_matches(client: Zhibo8Client, *, league_id: str | None = None) -> list[MatchSummary]:
-    payload = client.get_json(LIST_URL)
+def _parse_match_list(payload: dict[str, Any]) -> list[MatchSummary]:
     results: list[MatchSummary] = []
     for item in payload.get("list") or []:
         if item.get("type") != "football":
-            continue
-        if league_id and str(item.get("leagueid")) != str(league_id):
             continue
         results.append(
             MatchSummary(
@@ -88,6 +87,26 @@ def list_matches(client: Zhibo8Client, *, league_id: str | None = None) -> list[
             )
         )
     return results
+
+
+def list_matches(
+    client: Zhibo8Client,
+    *,
+    league_id: str | None = None,
+    force_refresh: bool = False,
+) -> list[MatchSummary]:
+    global _LIST_CACHE
+    now = time.time()
+    if not force_refresh and _LIST_CACHE and now - _LIST_CACHE[0] < _LIST_CACHE_TTL:
+        matches = _LIST_CACHE[1]
+    else:
+        payload = client.get_json(LIST_URL)
+        matches = _parse_match_list(payload if isinstance(payload, dict) else {})
+        _LIST_CACHE = (now, matches)
+
+    if league_id:
+        return [item for item in matches if str(item.leagueid) == str(league_id)]
+    return matches
 
 
 def list_world_cup_matches(client: Zhibo8Client) -> list[MatchSummary]:
@@ -125,7 +144,8 @@ def fetch_lineup(client: Zhibo8Client, saishi_id: str, sdate: str) -> dict[str, 
 
 
 def fetch_animate_code(client: Zhibo8Client, saishi_id: str, sdate: str) -> int:
-    text = client.get_text(ANIMATE_CODE_URL.format(date=sdate, saishi_id=saishi_id))
+    url = ANIMATE_CODE_URL.format(date=sdate, saishi_id=saishi_id)
+    text = client.get_text(url, cache_ttl=1.0)
     return int(text)
 
 
@@ -201,7 +221,7 @@ def format_match_event_line(event: dict[str, Any]) -> str | None:
 
 
 def fetch_max_sid(client: Zhibo8Client, saishi_id: str) -> int:
-    text = client.get_text(MAX_SID_URL.format(saishi_id=saishi_id))
+    text = client.get_text(MAX_SID_URL.format(saishi_id=saishi_id), cache_ttl=1.0)
     return int(text)
 
 
@@ -233,23 +253,26 @@ def format_livetext_line(item: dict[str, Any]) -> str:
     return f"[{score}] {body}"
 
 
-def fetch_livetext_updates(
+def _walk_livetext_pages(
     client: Zhibo8Client,
     saishi_id: str,
-    last_sid: int,
     *,
+    max_sid: int | None = None,
+    after_sid: int = 0,
     limit: int = 40,
+    item_filter: Callable[[dict[str, Any]], bool] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    max_sid = fetch_max_sid(client, saishi_id)
-    if max_sid <= 0:
-        return [], last_sid
+    if max_sid is None:
+        max_sid = fetch_max_sid(client, saishi_id)
+    if max_sid <= 0 or max_sid <= after_sid:
+        return [], after_sid
 
     collected: list[dict[str, Any]] = []
     seen: set[int] = set()
     page_sid = max_sid
     misses = 0
 
-    while page_sid > last_sid and len(collected) < limit and misses < 25:
+    while page_sid > after_sid and len(collected) < limit and misses < 25:
         batch = fetch_livetext(client, saishi_id, page_sid)
         if not batch:
             misses += 1
@@ -263,7 +286,9 @@ def fetch_livetext_updates(
             if live_sid <= 0:
                 continue
             min_sid = min(min_sid, live_sid)
-            if live_sid <= last_sid or live_sid in seen:
+            if live_sid <= after_sid or live_sid in seen:
+                continue
+            if item_filter and not item_filter(item):
                 continue
             seen.add(live_sid)
             collected.append(item)
@@ -274,8 +299,27 @@ def fetch_livetext_updates(
     if collected:
         new_last = max(int(item.get("live_sid") or 0) for item in collected)
     else:
-        new_last = last_sid
+        new_last = after_sid
     return collected, new_last
+
+
+def fetch_livetext_updates(
+    client: Zhibo8Client,
+    saishi_id: str,
+    last_sid: int,
+    *,
+    limit: int = 40,
+) -> tuple[list[dict[str, Any]], int]:
+    max_sid = fetch_max_sid(client, saishi_id)
+    if max_sid <= last_sid:
+        return [], last_sid
+    return _walk_livetext_pages(
+        client,
+        saishi_id,
+        max_sid=max_sid,
+        after_sid=last_sid,
+        limit=limit,
+    )
 
 
 def fetch_recent_livetext(
@@ -284,97 +328,13 @@ def fetch_recent_livetext(
     *,
     limit: int = 30,
 ) -> tuple[list[str], int]:
-    max_sid = fetch_max_sid(client, saishi_id)
-    if max_sid <= 0:
-        return [], 0
-
-    seen_sids: set[int] = set()
-    collected: list[tuple[int, str]] = []
-    misses = 0
-    page_sid = max_sid
-
-    while page_sid > 0 and len(collected) < limit and misses < 25:
-        batch = fetch_livetext(client, saishi_id, page_sid)
-        if not batch:
-            misses += 1
-            page_sid -= 1
-            continue
-
-        misses = 0
-        min_sid = page_sid
-        for item in batch:
-            live_sid = int(item.get("live_sid") or 0)
-            if live_sid <= 0 or live_sid in seen_sids:
-                continue
-            seen_sids.add(live_sid)
-            min_sid = min(min_sid, live_sid)
-            line = format_livetext_line(item)
-            if line:
-                collected.append((live_sid, line))
-
-        page_sid = min_sid - 1
-
-    collected.sort(key=lambda pair: pair[0])
-    last_sid = max(seen_sids) if seen_sids else max_sid
-    return [text for _, text in collected[-limit:]], last_sid
-
-
-def is_monster_brief(item: dict[str, Any]) -> bool:
-    if str(item.get("user_id") or "") == MONSTER_USER_ID:
-        return True
-    return str(item.get("user_chn") or "") == MONSTER_USER_NAME
-
-
-def format_brief(item: dict[str, Any]) -> str:
-    parts = [f"{item.get('live_ptime', '')} {item.get('live_text', '')}".strip()]
-    img_url = str(item.get("img_url") or "").strip()
-    if img_url:
-        parts.append(f"[图片] {img_url}")
-    text_url = str(item.get("text_url") or "").strip()
-    if text_url.startswith("http"):
-        parts.append(f"[视频] {text_url}")
-    score = f"{item.get('home_score', '-')}-{item.get('visit_score', '-')}"
-    return f"[{score}] {' '.join(part for part in parts if part)}"
-
-
-def fetch_recent_monster_briefs(
-    client: Zhibo8Client,
-    saishi_id: str,
-    *,
-    limit: int = 30,
-) -> tuple[list[str], int]:
-    max_sid = fetch_max_sid(client, saishi_id)
-    if max_sid <= 0:
-        return [], 0
-
-    seen_sids: set[int] = set()
-    collected: list[tuple[int, str]] = []
-    misses = 0
-    sid = max_sid
-
-    while sid > 0 and len(collected) < limit and misses < 15:
-        batch = fetch_livetext(client, saishi_id, sid)
-        if not batch:
-            misses += 1
-            sid -= 1
-            continue
-
-        misses = 0
-        min_sid = sid
-        for item in batch:
-            live_sid = int(item.get("live_sid") or 0)
-            if live_sid <= 0 or live_sid in seen_sids:
-                continue
-            seen_sids.add(live_sid)
-            min_sid = min(min_sid, live_sid)
-            if is_monster_brief(item):
-                collected.append((live_sid, format_brief(item)))
-
-        sid = min_sid - 1
-
-    collected.sort(key=lambda pair: pair[0])
-    last_sid = max(seen_sids) if seen_sids else max_sid
-    return [text for _, text in collected[-limit:]], last_sid
+    items, last_sid = _walk_livetext_pages(client, saishi_id, after_sid=0, limit=limit)
+    lines: list[str] = []
+    for item in items:
+        line = format_livetext_line(item)
+        if line:
+            lines.append(line)
+    return lines[-limit:], last_sid
 
 
 def normalize_starters(lineup_payload: dict[str, Any], team_id: str) -> list[dict[str, Any]]:

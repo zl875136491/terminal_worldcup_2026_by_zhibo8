@@ -58,7 +58,8 @@ class PitchAnimator:
             self._last_animate_code = animate_code
 
         self._frames = frames
-        self._frame_index = len(frames) - 1
+        playback_start = max(0, len(frames) - 5)
+        self._frame_index = playback_start
         self._apply_frame(self._frames[self._frame_index])
 
     def frame_progress(self) -> tuple[int, int]:
@@ -74,8 +75,9 @@ class PitchAnimator:
         self._apply_frame(self._frames[self._frame_index])
         return True
 
-    def update_from_animate(self, payload: dict[str, Any], *, animate_code: int = 0) -> None:
-        self.load_animate(payload, animate_code=animate_code)
+    def tick_animate(self) -> None:
+        if self.has_pending_frames():
+            self.advance_frame()
 
     def _apply_team_side(self, team: str) -> None:
         if not team:
@@ -203,10 +205,7 @@ class PitchAnimator:
         col = min(w - 1, max(0, round(self.state.ball_x * (w - 1))))
         row = min(h - 1, max(0, round(self.state.ball_y * (h - 1))))
         ball = "◎" if self.state.phase_hint and "VAR" in self.state.phase_hint else "●"
-        if grid[row][col] in {"┊", "─", "┼", "╫"}:
-            grid[row][col] = ball
-        else:
-            grid[row][col] = ball
+        grid[row][col] = ball
 
         home_label = (self.state.home_team or "主队")[:6]
         away_label = (self.state.away_team or "客队")[:6]

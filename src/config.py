@@ -19,6 +19,7 @@ DEFAULT_ZHIBO8_CONFIG: dict[str, Any] = {
         "animate": 2,
         "lineup": 60,
         "score": 10,
+        "report": 30,
     },
 }
 
