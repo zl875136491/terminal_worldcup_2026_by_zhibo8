@@ -525,27 +525,6 @@ def render_livetext_panel(
     return lines
 
 
-def render_brief_panel(
-    briefs: list[str],
-    inner_width: int,
-    status_message: str = "",
-    *,
-    max_lines: int | None = None,
-) -> list[str]:
-    if status_message:
-        lines = _wrap_lines(status_message, inner_width)
-    elif not briefs:
-        lines = ["暂无怪兽简报", "等待文字直播..."]
-    else:
-        lines = []
-        for brief in briefs[-20:]:
-            lines.extend(_wrap_lines(brief, inner_width))
-
-    if max_lines is not None and len(lines) > max_lines:
-        lines = lines[-max_lines:]
-    return lines
-
-
 def render_header(*, saishi_id: str, match_url: str, updated_at: datetime) -> list[str]:
     return [
         "直播吧世界杯终端看板  |  数据源: zhibo8.com",
@@ -622,7 +601,6 @@ def render_dashboard(
     events: list[dict[str, Any]],
     animator: PitchAnimator,
     live_feed: list[str],
-    briefs: list[str] | None = None,
     terminal_width: int,
     terminal_height: int = 30,
     status_message: str = "",
